@@ -1,124 +1,243 @@
-#include <ESP8266WiFi.h>           // Correct WiFi library for ESP8266
-#include <ESP8266WebServer.h>       // WebServer library for ESP8266
+#include <OneWire.h>
+#include <DallasTemperature.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <string.h> // Include the I2C library
 
-// Set up the Access Point SSID and password
-const char* ap_ssid = "motor_protection_system";  // Name of the access point
-const char* ap_password = "123456789";        // Password for the access point
 
-// Create web server on port 80
-ESP8266WebServer server(80);
 
-// Variables to store parsed sensor data
+
+// Pin definitions
+const int relayStopPin = 8;           // Relay to stop the motor (example pin number)
+const int buzzerPin = 9;             // Buzzer pin (example pin number)
+const int voltagepin = A0;           // Voltage sensor pin (example pin number)
+const int IR_sensor_pin = 2;         // IR sensor pin (example pin number)
+const int temp1 = 3;                 // Temp sensor 1 pin (example pin number)
+const int temp2 = 4;                 // Temp sensor 2 pin (example pin number)
+const int currentpin = A1;           // Current sensor pin (example pin number)
+const int b1 = 5;                    // Button 1 pin (example pin number)
+const int b2 = 6;                    // Button 2 pin (example pin number)
+const int b3 = 7;                    // Button 3 pin (example pin number)
+const int b4 = 10;                   // Button 4 pin (example pin number)
+
+const int oneWireBusPin = 11;        // Pin for OneWire bus for temperature sensors (example pin number)
+
+
+LiquidCrystal_I2C lcd(0x27, 16, 2); 
+// OneWire bus for DS18B20 sensors
+OneWire oneWire(oneWireBusPin);
+DallasTemperature sensors(&oneWire);
+// Addresses for DS18B20 sensors
+DeviceAddress tempMotorSensor, tempSurroundSensor;
+
+// Variables to store sensor readings
 float voltage = 0;
 float current = 0;
-  float tempMotor = 0;
+float tempMotor = 0;
 float tempSurround = 0;
 int rpm = 0;
-String motorState = "";
+int pulseCount = 0;
+unsigned long start_time = 0;
 
-// Setup: Initializes Serial communication and starts Access Point
+const unsigned long interval = 1000;  // Interval for RPM calculation
+
+// Motor control state
+String motorState = "Stopped";
+
 void setup() {
-  // Start Serial communication
   Serial.begin(9600);
-  delay(1000);  // Wait for Serial Monitor to start
 
-  // Start the Access Point (AP)
-  Serial.println("Setting up Access Point...");
-  WiFi.softAP(ap_ssid, ap_password);  // Start the ESP8266 as an Access Point
+  pinMode(relayStopPin, OUTPUT);
+  pinMode(buzzerPin, OUTPUT);
+  pinMode(voltagepin, INPUT);
+  pinMode(IR_sensor_pin, INPUT); 
+  pinMode(temp1, INPUT);
+  pinMode(temp2, INPUT);
+  pinMode(currentpin, INPUT);
+  pinMode(b1, INPUT_PULLUP);
+  pinMode(b2, INPUT_PULLUP);
+  pinMode(b3, INPUT_PULLUP);
+  pinMode(b4, INPUT_PULLUP);
   
-  // Print the IP address of the Access Point
-  IPAddress IP = WiFi.softAPIP();
-  Serial.print("Access Point IP Address: ");
-  Serial.println(IP);
+  attachInterrupt(digitalPinToInterrupt(IR_sensor_pin), countPulse, FALLING);
 
-  // Set up the web server route
-  server.on("/", handleRoot);  // Serve the web page when accessing root URL
-  
-  // Start the web server
-  server.begin();
+  // Initially started
+  digitalWrite(relayStopPin, HIGH);
+
+  // Initialize the DS18B20 temperature sensors
+  sensors.begin();
+
+  // Locate devices on the bus
+  if (!sensors.getAddress(tempMotorSensor, 0)) {
+    Serial.println("Motor temperature sensor not found!");
+  }
+  if (!sensors.getAddress(tempSurroundSensor, 1)) {
+    Serial.println("Surround temperature sensor not found!");
+  }
+
+  // Set resolution of DS18B20 sensors to 12 bits
+  sensors.setResolution(tempMotorSensor, 12);
+  sensors.setResolution(tempSurroundSensor, 12);
+
+
+  lcd.begin(16, 2); 
+  lcd.backlight();
 }
 
 void loop() {
-  // Handle incoming client requests for the web server
-  server.handleClient();
+  // Periodically read sensor data and send it to the ESP8266
+  readSensors();
+  calculateRPM();
+  displayed();
+  checkhealth();
+  sendSensorDataToESP();
+  
+  // Reset variables for the next measurement
+  pulseCount = 0;
+  start_time = millis();
 
-  // Check for incoming serial data from Arduino (or other microcontroller)
-  if (Serial.available()) {
-    String incomingData = Serial.readStringUntil('\n');  // Read incoming serial data
-    Serial.println("incomingData");
-   Serial.println(incomingData);
-    parseData(incomingData);
-    // Parse the data
+  // Re-enable interrupt
+  attachInterrupt(digitalPinToInterrupt(IR_sensor_pin), countPulse, FALLING); 
+}
+
+// Count pulses from the E18-D80NK sensor
+void countPulse() {
+  pulseCount++;
+}
+
+void calculateRPM() {
+  unsigned long current_time = millis();
+  if (current_time - start_time >= interval) {  // Calculate RPM every interval
+    detachInterrupt(digitalPinToInterrupt(IR_sensor_pin));  // Disable interrupt for accurate count
+
+    // Calculate RPM (pulses in one second * 60)
+    rpm = pulseCount * 60;
+
+    // Re-enable interrupt
+    attachInterrupt(digitalPinToInterrupt(IR_sensor_pin), countPulse, FALLING);  
   }
 }
 
-// Function to parse the comma-separated sensor data from Arduino
-void parseData(String data) {
-  // Find the indices of the commas to split the data
-  int commaIndex1 = data.indexOf(',');
-  int commaIndex2 = data.indexOf(',', commaIndex1 + 1);
-  int commaIndex3 = data.indexOf(',', commaIndex2 + 1);
-  int commaIndex4 = data.indexOf(',', commaIndex3 + 1);
-  int commaIndex5 = data.indexOf(',', commaIndex4 + 1);
-
-  // Parse the data and assign values to variables
-  voltage = data.substring(0, commaIndex1).toFloat();
-  current = data.substring(commaIndex1 + 1, commaIndex2).toFloat();
-  tempMotor = data.substring(commaIndex2 + 1, commaIndex3).toInt();
-  tempSurround = data.substring(commaIndex3 + 1, commaIndex4).toInt();
-  rpm = data.substring(commaIndex4 + 1).toInt();
-
-  // The motor state is the last item in the data
- motorState = data.substring(commaIndex5 + 1);  // Get the motor state ("Running" or "Stopped")
-
-  // Optionally print parsed data for debugging
-  Serial.println("Parsed Data:");
-  Serial.print("Voltage: "); Serial.println(voltage);
-  Serial.print("Current: "); Serial.println(current);
-  Serial.print("Motor Temp: "); Serial.println(tempMotor);
-  Serial.print("Surround Temp: "); Serial.println(tempSurround);
-  Serial.print("RPM: "); Serial.println(rpm);
-  Serial.print("Motor State: "); Serial.println(motorState);
+void stopmotor() {
+  digitalWrite(relayStopPin, HIGH);
 }
 
-// Function to handle the root URL of the web server (display data)
-void handleRoot() {
-  String html = "<html><head>";
-  
-  // Adding some basic styling for a modern and clean look
-  html += "<style>";
-  html += "body { font-family: Arial, sans-serif; background-color: #f4f4f9; margin: 0; padding: 0; color: #333; }";
-  html += "header { background-color: #4CAF50; padding: 15px; color: white; text-align: center; font-size: 24px; }";
-  html += "h1 { margin: 0; font-size: 28px; }";
-  html += "p { font-size: 18px; margin: 10px 0; }";
-  html += ".container { max-width: 800px; margin: 20px auto; padding: 20px; background-color: white; box-shadow: 0 4px 8px rgba(0, 0, 0, 0.1); border-radius: 8px; }";
-  html += ".data-item { font-size: 20px; color: #555; }";
-  html += ".data-item b { color: #4CAF50; }";
-  html += ".footer { text-align: center; margin-top: 20px; font-size: 14px; color: #888; }";
-  html += "</style>";
+void startmotor() {
+  digitalWrite(relayStopPin, LOW);
+}
 
-  // Auto-refresh the page every 1 second
-  html += "<meta http-equiv='refresh' content='1'>";  // This line forces a refresh every 1 second
-  
-  // Header of the page
-  html += "</head><body>";
-  html += "<header><h1>Motor Protection System</h1></header>";
-  
-  // Main content container
-  html += "<div class='container'>";
-  html += "<p class='data-item'><b>Voltage:</b> " + String(voltage) + " V</p>";
-  html += "<p class='data-item'><b>Current:</b> " + String(current) + " A</p>";
-  html += "<p class='data-item'><b>Motor Temperature:</b> " + String(tempMotor) + " °C</p>";
-  html += "<p class='data-item'><b>Surrounding Temperature:</b> " + String(tempSurround) + " °C</p>";
-  html += "<p class='data-item'><b>RPM:</b> " + String(rpm) + "</p>";
-  html += "<p class='data-item'><b>Motor State:</b> " + motorState + "</p>";
-  
-  // Footer
-  html += "<div class='footer'>Motor Protection System - ESP8266</div>";
+void readSensors() {
+  // Read DS18B20 temperature sensors
+  sensors.requestTemperatures();  // Send the command to get temperatures
+  tempMotor = sensors.getTempC(tempMotorSensor);  // Get motor temperature in °C
+  tempSurround = sensors.getTempC(tempSurroundSensor);  // Get surrounding temperature in °C
 
-  html += "</div>"; // Close container div
-  html += "</body></html>";
+  if (digitalRead(b1) == LOW) {
+    current = 3.5;
+    delay(500); 
+  } else if (digitalRead(b2) == LOW) {   
+    current = 0;
+    delay(500); 
+  } else {
+    current = 1.8;
+    delay(500); 
+  }
 
-  // Send the HTML content as a response
-  server.send(200, "text/html", html);
+  if (digitalRead(b3) == LOW) {
+    voltage = 330;
+    delay(500); 
+  } else if (digitalRead(b4) == LOW) {   
+    voltage = 500;
+    delay(500); 
+  } else {
+    voltage = 415;
+    delay(500); 
+  }
+}
+
+// Send sensor data to ESP8266 via Serial
+void sendSensorDataToESP() {
+  String data = String(voltage) + "," + String(current) + "," + String(tempMotor) + "," + String(tempSurround) + "," + String(rpm) + "," + String(motorState);
+  Serial.println(data);
+}
+
+void buz() {
+  for (int i = 0; i < 5; i++) {
+    digitalWrite(buzzerPin, HIGH);
+    delay(500);
+    digitalWrite(buzzerPin, LOW);
+    delay(500);
+  }
+}
+
+void displayed() {
+  // LCD display code here
+
+ lcd.clear();
+    lcd.setCursor(0, 0);  // Set cursor to first row
+    lcd.print("Volt: ");
+    lcd.print(voltage);   // Display voltage
+
+    lcd.setCursor(0, 1);  // Set cursor to second row
+    lcd.print("Current: ");
+    lcd.print(current);
+    delay(1000);
+    lcd.clear();
+    lcd.setCursor(0, 0);  // Set cursor to first row
+    lcd.print("temp motor : ");
+    lcd.print(tempMotor);   // Display voltage
+
+    lcd.setCursor(0, 1);  // Set cursor to second row
+    lcd.print("temp surr: ");
+    lcd.print(tempSurround);
+
+  delay(1000);
+}
+
+
+
+void displayalert() {
+  // LCD display code here
+
+lcd.clear();
+    lcd.setCursor(0, 0);  // Set cursor to first row
+    lcd.print("Stopped !!");
+    lcd.setCursor(0, 1);  // Set cursor to second row
+    lcd.print(motorState);
+    
+  
+}
+
+void checkhealth() {
+  float temp = 155 - tempSurround;
+
+  if (current == 0) {
+    stopmotor();
+    motorState = "Over-current";
+    buz();
+    displayalert();
+  } else if (current > 2.24) {   
+    stopmotor();
+    motorState = "Over-current";
+    buz();
+    displayalert();
+  } else if (voltage < 376) {   
+    stopmotor();
+    motorState = "Under-voltage";
+    buz();
+    displayalert();
+  } else if (voltage > 456) {   
+    stopmotor();
+    motorState = "Over-voltage";
+    buz();
+    displayalert();
+  } else if (tempMotor > temp) {   
+    stopmotor();
+    motorState = "Over-motor temperature";
+    buz();
+    displayalert();
+  } else {   
+    startmotor();
+    motorState = "Running";
+  }
 }
